@@ -1,6 +1,8 @@
 secrets.py
 output/*
+!output/.gitinclude
 spotify-data/*
+!spotify-data/.gitinclude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
