@@ -1,6 +1,8 @@
 import argparse
 import csv
 import hashlib
+import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -12,6 +14,26 @@ API_URL = "https://ws.audioscrobbler.com/2.0/"
 
 # Default behavior: change to False if you want unshifted by default without flags
 SHIFT_OLD_TIMESTAMPS_DEFAULT = True
+
+# Spacing used for shifted tracks whose play time is missing or implausibly short
+DEFAULT_STEP_SECONDS = 180
+
+# Service offline, temporarily unavailable, rate limit exceeded
+RETRYABLE_ERRORS = {11, 16, 29}
+MAX_ATTEMPTS = 5
+
+DAILY_LIMIT_IGNORED_CODE = "5"
+
+BATCH_SIZE = 50
+
+# Rows timestamp-shifted together. Big enough to cover a day's uploads, small enough
+# (~7 days of listening) to fit the 14-day window at real spacing.
+SHIFT_CHUNK_ROWS = 3000
+
+# Commonly reported Last.fm daily cap; only used for estimates when a run doesn't hit it
+ESTIMATED_DAILY_LIMIT = 2800
+
+PROGRESS_FILE = "upload_progress.json"
 
 
 def get_signature(params: dict, secret: str) -> str:
@@ -28,7 +50,27 @@ def to_unix_timestamp(ts_str: str) -> int:
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
 
-def scrobble_batch(batch_rows: list):
+def post_with_retries(params: dict) -> dict:
+    """POSTs to the API, retrying network failures and transient Last.fm errors with backoff."""
+    reason = ""
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            result = requests.post(API_URL, data=params, timeout=30).json()
+            if result.get("error") not in RETRYABLE_ERRORS:
+                return result
+            reason = f"Last.fm error {result['error']}: {result.get('message')}"
+        except (requests.RequestException, ValueError) as e:
+            reason = str(e)
+
+        if attempt < MAX_ATTEMPTS - 1:
+            delay = 10 * 2**attempt
+            print(f"  -> {reason}. Retrying in {delay}s...")
+            time.sleep(delay)
+
+    return {"error": None, "message": f"Gave up after {MAX_ATTEMPTS} attempts: {reason}"}
+
+
+def scrobble_batch(batch_rows: list) -> dict:
     """
     Submits a batch of up to 50 tracks to track.scrobble.
     batch_rows: list of dicts with keys: artist, track, album, timestamp, duration
@@ -54,9 +96,29 @@ def scrobble_batch(batch_rows: list):
     params["api_sig"] = get_signature(params, SHARED_SECRET)
     params["format"] = "json"
 
-    # POST payload
-    response = requests.post(API_URL, data=params)
-    return response.json()
+    return post_with_retries(params)
+
+
+def first_daily_limit_index(scrobbles: dict):
+    """Returns the in-batch index of the first track ignored for the daily limit, or None."""
+    items = scrobbles.get("scrobble", [])
+    # Last.fm returns a bare object instead of a list when the batch has one track
+    if isinstance(items, dict):
+        items = [items]
+    for idx, item in enumerate(items):
+        code = (item.get("ignoredMessage") or {}).get("code")
+        if str(code) == DAILY_LIMIT_IGNORED_CODE:
+            return idx
+    return None
+
+
+def playback_step(duration) -> int:
+    """Seconds between a shifted track and the next one, based on how long it played."""
+    try:
+        dur = int(duration)
+    except (ValueError, TypeError):
+        return DEFAULT_STEP_SECONDS
+    return dur if dur > 30 else DEFAULT_STEP_SECONDS
 
 
 def prepare_scrobble_records(all_rows: list, shift_old: bool) -> list:
@@ -64,6 +126,7 @@ def prepare_scrobble_records(all_rows: list, shift_old: bool) -> list:
     Converts raw CSV rows into prepared dictionaries.
     If shift_old is True, tracks older than 14 days have their timestamps
     remapped toward the current time so they are accepted by Last.fm.
+    Rows must be in chronological order.
     """
     now = int(time.time())
     # 14 days in seconds = 14 * 86400 = 1,209,600 seconds
@@ -105,25 +168,53 @@ def prepare_scrobble_records(all_rows: list, shift_old: bool) -> list:
         f"Found {len(old_indices)} tracks older than 14 days. Shifting timestamps forward to recent dates..."
     )
 
-    # We shift timestamps by calculating a synthetic window ending roughly 10 minutes ago
-    # spaced backwards sequentially by each track's duration (or 3 minutes if missing).
-    # This prevents stacking 1,000 songs onto the exact same second, which Last.fm would reject as spam.
-    current_synthetic_time = now - 600
+    # Old tracks are laid out in order, ending roughly 10 minutes ago and spaced by
+    # each track's play time. If that doesn't fit between the cutoff and now, the
+    # spacing is compressed so no track lands outside the window Last.fm accepts.
+    window_end = now - 600
+    steps = [playback_step(prepared[idx]["duration"]) for idx in old_indices]
+    # The newest track sits at window_end, so its own step takes up no room
+    needed = sum(steps[:-1])
+    available = window_end - cutoff_boundary
 
-    # Walk backwards through old tracks to preserve chronological playback ordering
-    for idx in reversed(old_indices):
-        item = prepared[idx]
-        item["timestamp"] = current_synthetic_time
+    scale = 1.0
+    if needed > available:
+        scale = available / needed
+        avg_gap = available / max(len(old_indices) - 1, 1)
+        print(
+            f"  Warning: {len(old_indices)} tracks don't fit in the 14-day window at real "
+            f"spacing; compressing to an average of {avg_gap:.0f}s apart."
+        )
 
-        try:
-            dur = int(item["duration"])
-            step = dur if dur > 30 else 180
-        except (ValueError, TypeError):
-            step = 180
-
-        current_synthetic_time -= step
+    synthetic_time = float(window_end)
+    prepared[old_indices[-1]]["timestamp"] = window_end
+    for idx, step in zip(reversed(old_indices[:-1]), reversed(steps[:-1])):
+        synthetic_time -= step * scale
+        prepared[idx]["timestamp"] = int(synthetic_time)
 
     return prepared
+
+
+def load_progress() -> dict:
+    """Reads saved upload positions, keyed by CSV path."""
+    if not os.path.exists(PROGRESS_FILE):
+        return {}
+    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_progress(progress: dict, key: str, next_row: int, total_rows: int):
+    """Records where the upload for this CSV should pick up next time."""
+    progress[key] = {
+        "next_row": next_row,
+        "total_rows": total_rows,
+        "last_run": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    tmp_path = PROGRESS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(progress, f, indent=2)
+    # Swap in whole so an interrupted run can't leave a half-written progress file
+    os.replace(tmp_path, PROGRESS_FILE)
 
 
 def main():
@@ -142,6 +233,13 @@ def main():
         action="store_true",
         help="Disable default behavior: do not alter timestamps older than 14 days (records will likely be ignored by Last.fm).",
     )
+    parser.add_argument(
+        "--start_row",
+        "-r",
+        type=int,
+        default=None,
+        help=f"Row of the CSV to start from, overriding the position saved in {PROGRESS_FILE}.",
+    )
     args = parser.parse_args()
 
     # Default is True unless --no_shift_old flag is passed
@@ -151,33 +249,102 @@ def main():
         reader = csv.reader(f)
         all_rows = [row for row in reader if row]
 
-    total_scrobbles = len(all_rows)
-    print(f"Loaded {total_scrobbles} scrobbles from {args.file}")
+    total_rows = len(all_rows)
+    print(f"Loaded {total_rows} songs from {args.file}")
     print(f"Timestamp shift enabled: {shift_old}")
 
-    prepared_records = prepare_scrobble_records(all_rows, shift_old=shift_old)
+    progress = load_progress()
+    progress_key = os.path.normpath(args.file)
+    saved = progress.get(progress_key)
 
-    batch_size = 50
-    for i in range(0, total_scrobbles, batch_size):
-        batch = prepared_records[i : i + batch_size]
-        batch_num = (i // batch_size) + 1
-        total_batches = (total_scrobbles + batch_size - 1) // batch_size
-        print(f"Scrobbling batch {batch_num}/{total_batches} ({len(batch)} tracks)...")
+    if saved:
+        last_run = datetime.fromisoformat(saved["last_run"])
+        hours_since = (datetime.now(timezone.utc) - last_run).total_seconds() / 3600
+        print(f"Last upload from this file was {hours_since:.1f} hours ago.")
+        if hours_since < 24:
+            print(
+                "  Warning: Last.fm's daily limit may not have reset yet. Trying anyway..."
+            )
 
-        result = scrobble_batch(batch)
+    if args.start_row is not None:
+        start_row = args.start_row
+    elif saved:
+        if saved["total_rows"] != total_rows:
+            print(
+                f"{args.file} has {total_rows} songs, but the saved progress was for "
+                f"{saved['total_rows']}. The file may have been regenerated, so the saved "
+                f"position can't be trusted."
+            )
+            print(
+                f"Pass --start_row to choose where to start, or remove its entry from {PROGRESS_FILE}."
+            )
+            return
+        start_row = saved["next_row"]
+    else:
+        start_row = 0
 
-        if "scrobbles" in result:
-            attr = result["scrobbles"].get("@attr", {})
+    if start_row >= total_rows:
+        print(f"All {total_rows} songs in {args.file} have already been uploaded.")
+        return
+
+    print(f"Starting from song {start_row + 1} of {total_rows}")
+
+    next_row = start_row
+    stop_reason = None
+    while next_row < total_rows and stop_reason is None:
+        chunk = all_rows[next_row : next_row + SHIFT_CHUNK_ROWS]
+        prepared_records = prepare_scrobble_records(chunk, shift_old=shift_old)
+
+        for i in range(0, len(prepared_records), BATCH_SIZE):
+            batch = prepared_records[i : i + BATCH_SIZE]
+            print(
+                f"Scrobbling songs {next_row + 1}-{next_row + len(batch)} of {total_rows}..."
+            )
+
+            result = scrobble_batch(batch)
+
+            if "scrobbles" not in result:
+                print(f"  -> API Error: {result}")
+                stop_reason = "error"
+                break
+
+            scrobbles = result["scrobbles"]
+            attr = scrobbles.get("@attr", {})
             accepted = attr.get("accepted", 0)
             ignored = attr.get("ignored", 0)
             print(f"  -> Result: {accepted} accepted, {ignored} ignored.")
-        else:
-            print(f"  -> API Error on batch {batch_num}: {result}")
 
-        # Pause to respect Last.fm rate limits
-        time.sleep(1)
+            limit_idx = first_daily_limit_index(scrobbles)
+            if limit_idx is not None:
+                print("Hit Last.fm's daily scrobble limit.")
+                next_row += limit_idx
+                stop_reason = "limit"
+                break
 
-    print("Finished uploading!")
+            next_row += len(batch)
+            save_progress(progress, progress_key, next_row, total_rows)
+
+            # Pause to respect Last.fm rate limits
+            time.sleep(1)
+
+    save_progress(progress, progress_key, next_row, total_rows)
+
+    sent = next_row - start_row
+    remaining = total_rows - next_row
+    print(f"Sent {sent} songs this run.")
+    if remaining == 0:
+        print(f"Finished uploading! All {total_rows} songs from {args.file} are done.")
+        return
+
+    per_day = sent if stop_reason == "limit" and sent > 0 else ESTIMATED_DAILY_LIMIT
+    days = math.ceil(remaining / per_day)
+    print(
+        f"{remaining} songs to go, estimated {days} more day(s) at ~{per_day} per day."
+    )
+    if stop_reason == "error":
+        print(f"Stopped on an API error. Run again to retry from song {next_row + 1}.")
+    else:
+        print("Run this again tomorrow to pick up where it left off.")
 
 
 if __name__ == "__main__":

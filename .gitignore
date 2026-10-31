@@ -1,4 +1,5 @@
 secrets.py
+upload_progress.json*
 output/*
 !output/.gitinclude
 spotify-data/*

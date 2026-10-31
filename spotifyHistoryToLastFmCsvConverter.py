@@ -192,6 +192,10 @@ def main():
                 [artist, track, album, timestamp_str, album_artist, duration]
             )
 
+    # File order isn't chronological (e.g. "_10.json" sorts before "_2.json"), and both
+    # the -m chunks and the uploader's timestamp shift rely on rows being in play order
+    all_rows.sort(key=lambda row: row[3])
+
     total_scrobbles = len(all_rows)
     print(f"Total valid scrobbles collected: {total_scrobbles}")
 

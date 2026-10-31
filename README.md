@@ -6,7 +6,7 @@ Have you ever wanted to get day-to-day metrics on your listening? Are you alread
 
 Some fun things you can do:
 
-- Get your entire listening history from Spotify to LastFm
+- Get your entire listening history from Spotify to LastFm (see [Uploading your entire history](#uploading-your-entire-history))
 - Filter for specific days in your listening history when Last.fm missed your scrobbles
 
 ## Exporting Spotify data
@@ -60,9 +60,42 @@ Use one export or the other, not both. They overlap, so using both would upload 
    | ---------------- | ------------------- | ----------------------------------------------------- |
    | `-f`, `--file`   | `output/output.csv` | CSV to upload                                         |
    | `--no_shift_old` | off                 | Keep original timestamps for plays older than 14 days |
+   | `-r`, `--start_row` | saved progress   | Row to start from, overriding the position saved in `upload_progress.json` |
+
+   The uploader sends songs in batches of 50 until it finishes the file or hits Last.fm's daily limit, saving its position in `upload_progress.json` as it goes. Run the same command again later and it picks up where it left off.
 
 ## Notes
 
 - Last.fm rejects scrobbles older than 14 days. By default, older plays are re-timestamped to recent times (kept in order, spaced by track duration) so they are accepted. Use `--no_shift_old` to keep real timestamps; those plays will likely be ignored.
-- Last.fm has a daily scrobble limit. For large histories, split with `-m` and upload one file per day. My command for ensuring it didn't go over the limit and filtered for a given date range, March 10 to April 21 in 2026, was `python spotifyHistoryToLastFmCsvConverter.py -m 2500 -s 20260310 -e 20260421`
-- `secrets.py` and the contents of `spotify-data/` and `output/` are gitignored.
+- Songs are re-timestamped 3,000 at a time, which fits the 14-day window at real spacing.
+- Last.fm has a daily scrobble limit (commonly reported as about 2,800). When an upload hits it, the uploader stops, saves its position and estimates how many days are left. Progress is tracked per CSV, so splitting with `-m` still works if you prefer smaller files. My command for ensuring it didn't go over the limit and filtered for a given date range, March 10 to April 21 in 2026, was `python spotifyHistoryToLastFmCsvConverter.py -m 2500 -s 20260310 -e 20260421`
+- `secrets.py`, `upload_progress.json` and the contents of `spotify-data/` and `output/` are gitignored.
+
+## Uploading your entire history
+
+A full history can be hundreds of thousands of plays, and Last.fm only accepts a few thousand a day, so this is a daily routine that can run for weeks or months. Get comfortable.
+
+1. Request the **Extended streaming history** export (see [Exporting Spotify data](#exporting-spotify-data)) and put its JSON files in `spotify-data/`.
+2. Convert everything once:
+
+   ```
+   python spotifyHistoryToLastFmCsvConverter.py
+   ```
+
+   This writes every play to `output/output.csv`, oldest first.
+
+3. Run the uploader once a day with the same command, every day:
+
+   ```
+   python sendToLastFm.py
+   ```
+
+   - **Day 1:** starts from song 1 and keeps sending until Last.fm's daily limit stops it, e.g. `Sent 2800 songs this run. 97200 songs to go, estimated 35 more day(s) at ~2800 per day.`
+   - **Day 2:** reads `upload_progress.json`, prints `Starting from song 2801 of 100000` and carries on.
+   - **Every day after:** same command, until it prints `Finished uploading!`
+
+   If you run it again too soon, it warns that the daily limit may not have reset and tries anyway; any songs Last.fm refuses are retried on the next run. If an API error stops a run, run it again and it retries from where it stopped.
+
+   Don't regenerate `output.csv` partway through. The saved position is a row number, so the uploader refuses to continue if the file's row count changes. Use `--start_row` to set the position yourself if you need to.
+
+Older plays are re-timestamped to land in the last 14 days, so on Last.fm your full history shows up as recent listening rather than on the dates you actually played it. Total play counts per artist, album and track still come out right.
