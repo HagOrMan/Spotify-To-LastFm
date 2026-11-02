@@ -6,9 +6,12 @@ import os
 import time
 from datetime import datetime, timezone
 
-import pandas as pd
-
 OUTPUT_FOLDER = "output"
+
+
+def write_csv(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f, quoting=csv.QUOTE_ALL).writerows(rows)
 
 
 def parse_date_arg(date_str: str) -> datetime:
@@ -203,8 +206,6 @@ def main():
         print("No scrobbles matched your criteria. No CSV files created.")
         return
 
-    csv_columns = ["artist", "track", "album", "timestamp", "album_artist", "duration"]
-
     if args.max_scrobbles > 0:
         num_files = (total_scrobbles + args.max_scrobbles - 1) // args.max_scrobbles
         for i in range(num_files):
@@ -212,24 +213,12 @@ def main():
             end_idx = min((i + 1) * args.max_scrobbles, total_scrobbles)
             chunk = all_rows[start_idx:end_idx]
 
-            df = pd.DataFrame(chunk, columns=csv_columns)
             filename = f"output_{i + 1}.csv"
-            df.to_csv(
-                os.path.join(OUTPUT_FOLDER, filename),
-                index=False,
-                header=False,
-                quoting=csv.QUOTE_ALL,
-            )
-            print(f"Wrote {filename} with {len(df)} rows.")
+            write_csv(os.path.join(OUTPUT_FOLDER, filename), chunk)
+            print(f"Wrote {filename} with {len(chunk)} rows.")
     else:
-        df = pd.DataFrame(all_rows, columns=csv_columns)
-        df.to_csv(
-            os.path.join(OUTPUT_FOLDER, "output.csv"),
-            index=False,
-            header=False,
-            quoting=csv.QUOTE_ALL,
-        )
-        print(f"Wrote output.csv with {len(df)} rows.")
+        write_csv(os.path.join(OUTPUT_FOLDER, "output.csv"), all_rows)
+        print(f"Wrote output.csv with {len(all_rows)} rows.")
 
     elapsed = time.perf_counter() - start_time
     print(f"Convert finished in {elapsed:.2f} seconds")
