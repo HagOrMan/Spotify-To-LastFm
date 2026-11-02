@@ -20,7 +20,7 @@ DEFAULT_STEP_SECONDS = 180
 
 # Service offline, temporarily unavailable, rate limit exceeded
 RETRYABLE_ERRORS = {11, 16, 29}
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 3
 
 DAILY_LIMIT_IGNORED_CODE = "5"
 
@@ -67,7 +67,10 @@ def post_with_retries(params: dict) -> dict:
             print(f"  -> {reason}. Retrying in {delay}s...")
             time.sleep(delay)
 
-    return {"error": None, "message": f"Gave up after {MAX_ATTEMPTS} attempts: {reason}"}
+    return {
+        "error": None,
+        "message": f"Gave up after {MAX_ATTEMPTS} attempts: {reason}",
+    }
 
 
 def scrobble_batch(batch_rows: list) -> dict:
