@@ -1,3 +1,5 @@
+<img width="6912" height="2395" alt="Old internet Spotify to Last fm grid" src="https://github.com/user-attachments/assets/42487cf0-9865-4b2f-8aef-2af141f24430" />
+
 # Spotify History → Last.fm
 
 Converts your Spotify streaming history export into scrobbles and uploads them to Last.fm.
